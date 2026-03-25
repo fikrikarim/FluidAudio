@@ -18,6 +18,7 @@ public actor PocketTtsModelStore {
     private var mimiEncoderModel: MLModel?
     private var constantsBundle: PocketTtsConstantsBundle?
     private var voiceCache: [String: PocketTtsVoiceData] = [:]
+    private var voiceKVCache: [String: PocketTtsSynthesizer.KVCacheState] = [:]
     private var repoDirectory: URL?
     private let directory: URL?
 
@@ -121,6 +122,29 @@ public actor PocketTtsModelStore {
             throw PocketTTSError.modelNotFound("PocketTTS repository not loaded")
         }
         return dir
+    }
+
+    /// Return cached voice KV state, if available.
+    func cachedVoiceKVState(for voice: String) -> PocketTtsSynthesizer.KVCacheState? {
+        voiceKVCache[voice]
+    }
+
+    /// Store a voice KV state for reuse across synthesis calls.
+    func setVoiceKVCache(_ state: PocketTtsSynthesizer.KVCacheState, for voice: String) {
+        voiceKVCache[voice] = state
+    }
+
+    /// Prefill and cache the voice KV state. Runs inside the actor so MLModel stays isolated.
+    func prewarmVoiceKVCache(for voice: String) async throws {
+        guard voiceKVCache[voice] == nil else { return }
+        let vd = try await voiceData(for: voice)
+        guard let model = condStepModel else {
+            throw PocketTTSError.modelNotFound("cond_step model not loaded")
+        }
+        let state = try await PocketTtsSynthesizer.prefillVoiceKVCache(
+            voiceData: vd, model: model
+        )
+        voiceKVCache[voice] = state
     }
 
     /// Load and cache voice conditioning data, downloading from HuggingFace if missing.

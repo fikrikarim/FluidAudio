@@ -39,10 +39,16 @@ public actor PocketTtsManager {
     }
 
     /// Initialize by downloading and loading all PocketTTS models.
+    /// Pre-warms the voice KV cache for the default voice to eliminate first-call latency.
     public func initialize() async throws {
         try await modelStore.loadIfNeeded()
         isInitialized = true
-        logger.notice("PocketTtsManager initialized")
+
+        // Pre-warm: prefill KV cache for default voice so first synthesis is fast
+        logger.notice("Pre-warming voice KV cache for '\(defaultVoice)'...")
+        try await modelStore.prewarmVoiceKVCache(for: defaultVoice)
+
+        logger.notice("PocketTtsManager initialized (voice KV cache ready)")
     }
 
     /// Synthesize text to WAV audio data.

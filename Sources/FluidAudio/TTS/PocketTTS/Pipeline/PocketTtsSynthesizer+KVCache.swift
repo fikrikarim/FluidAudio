@@ -86,23 +86,39 @@ extension PocketTtsSynthesizer {
         }
     }
 
-    /// Prefill the KV cache with voice and text conditioning tokens.
-    ///
-    /// Processes voice tokens first, then text tokens. This ordering is critical —
-    /// the model was trained with voice conditioning before text, so reversing it
-    /// produces garbage. Each chunk gets a fresh cache because the 512-position
-    /// limit can't hold multiple chunks' worth of context.
-    static func prefillKVCache(
+    /// Deep-copy a KV cache state. Required because MLMultiArray is a reference type.
+    static func cloneKVCacheState(_ state: KVCacheState) throws -> KVCacheState {
+        var newCaches: [MLMultiArray] = []
+        var newPositions: [MLMultiArray] = []
+        newCaches.reserveCapacity(state.caches.count)
+        newPositions.reserveCapacity(state.positions.count)
+
+        for cache in state.caches {
+            let copy = try MLMultiArray(shape: cache.shape, dataType: cache.dataType)
+            let bytes = cache.count * MemoryLayout<Float>.size
+            if bytes > 0 {
+                copy.dataPointer.copyMemory(from: cache.dataPointer, byteCount: bytes)
+            }
+            newCaches.append(copy)
+        }
+        for pos in state.positions {
+            let copy = try MLMultiArray(shape: [1], dataType: .float32)
+            copy[0] = pos[0]
+            newPositions.append(copy)
+        }
+        return KVCacheState(caches: newCaches, positions: newPositions)
+    }
+
+    /// Prefill the KV cache with voice tokens only (positions 0..<promptLength).
+    /// The result can be cached and reused across calls with the same voice.
+    static func prefillVoiceKVCache(
         voiceData: PocketTtsVoiceData,
-        textEmbeddings: [[Float]],
         model: MLModel
     ) async throws -> KVCacheState {
         var state = try emptyKVCacheState()
         let dim = PocketTtsConstants.embeddingDim
 
-        // Voice tokens first (positions 0..124)
-        let voiceTokenCount = voiceData.promptLength
-        for tokenIdx in 0..<voiceTokenCount {
+        for tokenIdx in 0..<voiceData.promptLength {
             let token = try createConditioningToken(
                 from: voiceData.audioPrompt,
                 offset: tokenIdx * dim,
@@ -111,14 +127,50 @@ extension PocketTtsSynthesizer {
             try await runCondStep(conditioning: token, state: &state, model: model)
         }
 
-        // Text tokens next
+        let finalPos = state.positions[0][0].floatValue
+        logger.info("Voice KV cache prefilled to position \(Int(finalPos))")
+
+        return state
+    }
+
+    /// Prefill the KV cache with voice and text conditioning tokens.
+    ///
+    /// If `cachedVoiceState` is provided, deep-copies it and skips voice prefill.
+    /// Otherwise processes voice tokens first, then text tokens (critical ordering).
+    static func prefillKVCache(
+        voiceData: PocketTtsVoiceData,
+        textEmbeddings: [[Float]],
+        model: MLModel,
+        cachedVoiceState: KVCacheState? = nil
+    ) async throws -> KVCacheState {
+        var state: KVCacheState
+
+        if let cached = cachedVoiceState {
+            // Fast path: clone the pre-computed voice KV state
+            state = try cloneKVCacheState(cached)
+        } else {
+            // Slow path: compute voice KV from scratch
+            state = try emptyKVCacheState()
+            let dim = PocketTtsConstants.embeddingDim
+            for tokenIdx in 0..<voiceData.promptLength {
+                let token = try createConditioningToken(
+                    from: voiceData.audioPrompt,
+                    offset: tokenIdx * dim,
+                    dim: dim
+                )
+                try await runCondStep(conditioning: token, state: &state, model: model)
+            }
+        }
+
+        // Text tokens
+        let dim = PocketTtsConstants.embeddingDim
         for embedding in textEmbeddings {
             let token = try createConditioningToken(from: embedding, offset: 0, dim: dim)
             try await runCondStep(conditioning: token, state: &state, model: model)
         }
 
         let finalPos = state.positions[0][0].floatValue
-        logger.info("KV cache prefilled to position \(Int(finalPos))")
+        logger.info("KV cache prefilled to position \(Int(finalPos))\(cachedVoiceState != nil ? " (voice cached)" : "")")
 
         return state
     }

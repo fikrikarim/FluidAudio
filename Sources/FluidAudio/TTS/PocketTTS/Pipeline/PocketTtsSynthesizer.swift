@@ -407,8 +407,9 @@ public struct PocketTtsSynthesizer {
         let bosEmb = try createBosEmbedding(constants.bosEmbedding)
         let seedValue = seed ?? UInt64.random(in: 0...UInt64.max)
         let chunkCount = chunks.count
+        let cachedVoiceKV = await store.cachedVoiceKVState(for: voice)
 
-        logger.info("Streaming \(chunkCount) chunk(s)")
+        logger.info("Streaming \(chunkCount) chunk(s)\(cachedVoiceKV != nil ? " (voice KV cached)" : "")")
 
         let generator = StreamingGenerator(
             constants: constants,
@@ -422,7 +423,10 @@ public struct PocketTtsSynthesizer {
             bosEmb: bosEmb,
             seedValue: seedValue,
             chunkCount: chunkCount,
-            temperature: temperature
+            temperature: temperature,
+            cachedVoiceKVState: cachedVoiceKV,
+            voiceName: voice,
+            modelStore: store
         )
 
         return makeStream(generator: generator)
@@ -461,6 +465,7 @@ public struct PocketTtsSynthesizer {
         let seedValue = seed ?? UInt64.random(in: 0...UInt64.max)
         let chunkCount = chunks.count
 
+        // Custom voice data: no cache key, compute fresh each time
         let generator = StreamingGenerator(
             constants: constants,
             voiceData: voiceData,
@@ -473,7 +478,10 @@ public struct PocketTtsSynthesizer {
             bosEmb: bosEmb,
             seedValue: seedValue,
             chunkCount: chunkCount,
-            temperature: temperature
+            temperature: temperature,
+            cachedVoiceKVState: nil,
+            voiceName: "_custom_voice",
+            modelStore: store
         )
 
         return makeStream(generator: generator)
@@ -499,6 +507,9 @@ public struct PocketTtsSynthesizer {
         var rng: SeededRNG
         let chunkCount: Int
         let temperature: Float
+        var cachedVoiceKVState: KVCacheState?
+        let voiceName: String
+        let modelStore: PocketTtsModelStore
 
         init(
             constants: PocketTtsConstantsBundle,
@@ -512,7 +523,10 @@ public struct PocketTtsSynthesizer {
             bosEmb: MLMultiArray,
             seedValue: UInt64,
             chunkCount: Int,
-            temperature: Float
+            temperature: Float,
+            cachedVoiceKVState: KVCacheState?,
+            voiceName: String,
+            modelStore: PocketTtsModelStore
         ) {
             self.constants = constants
             self.voiceData = voiceData
@@ -526,6 +540,9 @@ public struct PocketTtsSynthesizer {
             self.rng = SeededRNG(seed: seedValue)
             self.chunkCount = chunkCount
             self.temperature = temperature
+            self.cachedVoiceKVState = cachedVoiceKVState
+            self.voiceName = voiceName
+            self.modelStore = modelStore
         }
 
         /// Flow decode using actor-isolated RNG state.
@@ -593,10 +610,20 @@ public struct PocketTtsSynthesizer {
                     let textEmbeddings = PocketTtsSynthesizer.embedTokens(
                         tokenIds, constants: constants)
 
+                    // Compute and cache voice KV state on first chunk if not already cached
+                    if cachedVoiceKVState == nil {
+                        cachedVoiceKVState = try await PocketTtsSynthesizer.prefillVoiceKVCache(
+                            voiceData: voiceData,
+                            model: condModel
+                        )
+                        await modelStore.setVoiceKVCache(cachedVoiceKVState!, for: voiceName)
+                    }
+
                     var kvState = try await PocketTtsSynthesizer.prefillKVCache(
                         voiceData: voiceData,
                         textEmbeddings: textEmbeddings,
-                        model: condModel
+                        model: condModel,
+                        cachedVoiceState: cachedVoiceKVState
                     )
 
                     let maxGenLen = PocketTtsSynthesizer.estimateMaxFrames(text: chunkText)
